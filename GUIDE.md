@@ -21,6 +21,8 @@ pip install -r requirements-colab.txt
 python -m pytest -q
 ```
 
+Lab dùng bitsandbytes, không cần backend torchao. Nếu Colab có sẵn `torchao==0.10.0`, gỡ bằng `%pip uninstall -y torchao` trước khi import PEFT, rồi chọn **Runtime → Restart session** nếu đã import thư viện. PEFT 0.21.2 yêu cầu torchao >= 0.16.0 khi torchao được cài; E3 có thể chạm kiểm tra này khi gắn LoRA lên các lớp ViT. Không cần nâng cấp torch/torchvision để sửa lỗi này. Ô môi trường trong notebook đã có lệnh gỡ torchao.
+
 Nếu gặp `ImportError ... requires the Torchvision library`: cài `torchvision` cùng bản torch của Colab.
 
 ## Bước 1 · Dữ liệu
@@ -67,7 +69,7 @@ Viết **prompt** yêu cầu model chỉ trả JSON list, nêu 3 lớp và nói 
 ```
 quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                   bnb_4bit_compute_dtype=float16, bnb_4bit_use_double_quant=True,
-                  llm_int8_skip_modules=["visual", "lm_head"])
+                  llm_int8_skip_modules=["model.visual", "visual", "lm_head"])
 model = Qwen3VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen3-VL-4B-Instruct", quantization_config=quantization,
             dtype=float16, device_map={"": 0})
@@ -89,7 +91,7 @@ Chấm:
 python scripts/score.py --pred work/e0.jsonl --name E0 --out report/evidence/e0.json
 ```
 
-> `llm_int8_skip_modules=["visual","lm_head"]` giữ ViT (kể cả projector) ở fp16. Nếu ViT bị lượng tử hoá 4-bit, trọng số của merger là trọng số lượng tử và **không thể huấn luyện đầy đủ** ở E2/E3.
+> Với Transformers 5.19, dùng `llm_int8_skip_modules=["model.visual","visual","lm_head"]` để giữ ViT (kể cả projector) ở fp16. Tên thực tế bắt đầu bằng `model.visual`; chỉ dùng `"visual"` không loại trừ các lớp con trong phiên bản này. Nếu ViT bị lượng tử hoá 4-bit, trọng số của merger là trọng số lượng tử và **không thể huấn luyện đầy đủ** ở E2/E3. Notebook kiểm tra điều này ngay sau khi nạp base model và trước khi mở gradient.
 
 **Kiểm tra:** `parse_valid_rate` là bao nhiêu? In 5 output thô để xem model trả gì (có bọc ```json không? có chữ thừa không?).
 
@@ -132,6 +134,8 @@ hàm apply_setup(model, setup):
     nếu setup là E2 hoặc E3:
         với mọi tham số có tên chứa "visual.merger" hoặc "visual.deepstack_merger_list":
             đưa về float32;  requires_grad = True
+    với mọi tham số requires_grad (cả LoRA và projector): đưa về float32
+    kiểm tra dtype float32 trước khi tạo optimizer
     in tổng số tham số huấn luyện
 ```
 
@@ -154,6 +158,7 @@ lặp đến khi đủ max_steps = 300 bước tối ưu:
         nếu loss không hữu hạn: DỪNG và báo (nguy cơ tràn số fp16)
         scaler.scale(loss).backward()
     scaler.unscale_(opt); clip_grad_norm_(params, 1.0); scaler.step(opt); scaler.update(); opt.zero_grad()
+    chỉ tăng step và cập nhật scheduler nếu GradScaler không bỏ qua bước do tràn gradient
     mỗi 100 bước: lưu adapter  VÀ  lưu riêng các tham số projector đã huấn luyện (E2, E3)
 ghi run.json: trainable_params, peak_vram_gb (torch.cuda.max_memory_allocated), train_minutes
 ```
@@ -179,6 +184,8 @@ python scripts/score.py --pred work/e1.jsonl --name E1 --out report/evidence/e1.
 
 Mẹo: gỡ lỗi trên 40 ảnh của `val` (`--split val`); chỉ chấm `test` một lần cho mỗi setup.
 
+Notebook lưu projector ở float32 và dùng `autocast(float16)` cả lúc suy luận để tương thích với ViT float16. Thiếu adapter, projector hoặc `run.json` thì dừng đánh giá; không điền số liệu tài nguyên thay thế. Checkpoint mới có `completed_steps` để phát hiện lần train chưa hoàn tất.
+
 **Kiểm tra:** E1 phải hơn hẳn E0. Nếu không, kiểm tra mask loss (bước 4) và thang toạ độ (bước 2).
 
 **Câu hỏi:** lập bảng E0–E3 trong `REPORT.md` (F1, CI95, FP/ảnh, F1 từng lớp, VRAM, thời gian). Setup nào đáng đồng tiền nhất? Chênh lệch có vượt khoảng tin cậy không?
@@ -194,6 +201,8 @@ Mẹo: gỡ lỗi trên 40 ảnh của `val` (`--split val`); chỉ chấm `test
 | `coord_scale` | `norm1000` và `pixel`: đổi **cả** nhãn, prompt, và chấm với `--coord pixel` |
 
 Lưu: `report/evidence/e4_<biến>_<giá trị>.json`.
+
+Notebook chọn setup bằng F1 trên `val`, chạy cả rank 4 và 64, và lưu vào `work/e4_rank_4/`, `work/e4_rank_64/`. Không dùng lại thư mục checkpoint E1–E3. Nếu cần đổi batch để vừa VRAM, giữ cùng batch và grad accumulation cho mọi thí nghiệm so sánh.
 
 **Câu hỏi:** kết luận của bạn có đáng tin không khi test chỉ có 311 ảnh? (Nhìn CI95.)
 
@@ -220,8 +229,17 @@ GRPO: khởi tạo từ adapter tốt nhất, `num_generations=4`, `max_completi
 | Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
 |---|---|---|
 | `CUDA out of memory` | batch quá lớn, quên gradient checkpointing | `batch_size=1`, `grad_accum=8`, bật gradient checkpointing |
+| `Attempting to unscale FP16 gradients` | còn trọng số trainable float16; Colab giữ định nghĩa hàm cũ | đưa toàn bộ LoRA/projector trainable về float32 trước optimizer; chạy lại các ô định nghĩa setup/train/evaluate |
+| `only Tensors of floating point and complex dtype can require gradients` | projector vẫn là `Params4bit`/uint8 vì skip_modules không khớp tên `model.visual` | thêm `"model.visual"` vào skip_modules và nạp lại base; `.float()` không giải lượng tử trọng số đóng gói |
+| `Found an incompatible version of torchao ... 0.10.0` | backend torchao cũ có sẵn trong Colab bị PEFT kiểm tra khi gắn LoRA | `%pip uninstall -y torchao`, restart session rồi nạp lại các imports/hàm; lab dùng bitsandbytes nên không cần torchao |
 | Loss `nan`/`inf` | tràn số fp16 | giảm lr; thử `batch_size=1`; kiểm tra bạn đã mask đúng |
 | F1 E2/E3 ≈ E1 chính xác | quên nạp lại projector lúc suy luận | lưu và nạp `extra_trainable` (bước 6) |
 | `parse_valid_rate` thấp | model lặp vô hạn / bị cắt | tăng `max_new_tokens`, kiểm tra token kết thúc `<|im_end|>` trong nhãn |
 | F1 ≈ 0 mà JSON hợp lệ | sai thang toạ độ (pixel thay vì 0–1000) | xem lại bước 2 và `--coord` |
 | Mất session giữa chừng | Colab free ngắt | chép adapter lên Drive sau mỗi lần |
+
+Sau khi cập nhật notebook, chạy lại ô imports/processor cùng các hàm `make_quantization_config`, `load_base_model` ở mục 3, rồi các ô định nghĩa setup/train/evaluate trước khi chạy riêng ô E2. Ô tải model E0 đã tách riêng để có thể bỏ qua. Nếu lần E2 trước đã lưu checkpoint dở, chạy `meta_e2 = train_experiment('E2', run_name='e2_retry')`, rồi `evaluate_experiment('E2', meta_e2, evidence_filename='e2.json')`. Nếu traceback cũ giữ VRAM, restart session và nạp lại dữ liệu, processor, imports và các hàm. E0/E1 chạy bằng config cũ có thể đã lượng tử hoá cả ViT: chạy lại với config mới để so sánh nhất quán, dùng run_name mới để giữ checkpoint cũ.
+
+Cách khớp module của bản đã ghim: [Transformers 5.19 `should_convert_module`](https://github.com/huggingface/transformers/blob/v5.19.0/src/transformers/quantizers/quantizers_utils.py).
+
+Hướng dẫn dtype chính thức: [PEFT troubleshooting](https://huggingface.co/docs/peft/developer_guides/troubleshooting#valueerror-attempting-to-unscale-fp16-gradients).
